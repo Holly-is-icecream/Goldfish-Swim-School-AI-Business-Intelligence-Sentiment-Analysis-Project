@@ -1,0 +1,448 @@
+# -------------------------
+# 1. Import libraries
+# -------------------------
+
+import os
+import pandas as pd
+import google.generativeai as genai
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font
+
+
+# -------------------------
+# 2. Configure Gemini API
+# -------------------------
+
+genai.configure(api_key="My API")
+
+model = genai.GenerativeModel("models/gemini-2.5-flash")
+
+
+# -------------------------
+# 3. Read Excel data
+# -------------------------
+
+file_path = "goldfish_raw_operational_data.xlsx"
+df = pd.read_excel(file_path)
+
+
+# -------------------------
+# 4. Create Business Metrics
+# -------------------------
+
+df["Occupancy_Rate"] = df["Students_in_Class"] / df["Class_Capacity"]
+
+def classify_occupancy(rate):
+    if rate > 1:
+        return "Overflow"
+    elif rate >= 0.90:
+        return "Near Full"
+    elif rate >= 0.70:
+        return "Healthy"
+    else:
+        return "Underutilized"
+
+df["Occupancy_Status"] = df["Occupancy_Rate"].apply(classify_occupancy)
+
+df["Date"] = pd.to_datetime(df["Date"])
+df["Day_of_Week"] = df["Date"].dt.day_name()
+df["Is_Weekend"] = df["Day_of_Week"].isin(["Saturday", "Sunday"])
+
+
+# -------------------------
+# 5. Generate KPI Summary
+# -------------------------
+
+total_students = df["Students_in_Class"].sum()
+total_capacity = df["Class_Capacity"].sum()
+overall_occupancy = total_students / total_capacity
+
+summary = {
+    "total_records": len(df),
+    "total_students": int(total_students),
+    "total_capacity": int(total_capacity),
+    "overall_occupancy_rate": round(overall_occupancy, 4),
+    "average_parent_rating": round(df["Parent_Rating"].mean(), 2),
+    "cancelled_classes": int((df["Attendance_Status"] == "Cancelled").sum()),
+    "cancellation_rate": round((df["Attendance_Status"] == "Cancelled").mean(), 4),
+    "late_arrivals": int((df["Attendance_Status"] == "Late").sum()),
+    "late_arrival_rate": round((df["Attendance_Status"] == "Late").mean(), 4),
+    "overflow_classes": int((df["Occupancy_Status"] == "Overflow").sum()),
+    "near_full_classes": int((df["Occupancy_Status"] == "Near Full").sum()),
+    "underutilized_classes": int((df["Occupancy_Status"] == "Underutilized").sum()),
+}
+
+
+# -------------------------
+# 6. Location Summary
+# -------------------------
+
+location_summary = (
+    df.groupby("Location")
+    .agg(
+        total_students=("Students_in_Class", "sum"),
+        total_capacity=("Class_Capacity", "sum"),
+        avg_parent_rating=("Parent_Rating", "mean"),
+        total_records=("Location", "count")
+    )
+    .reset_index()
+)
+
+location_summary["occupancy_rate"] = (
+    location_summary["total_students"] / location_summary["total_capacity"]
+)
+
+location_summary = location_summary.sort_values("occupancy_rate", ascending=False)
+
+
+# -------------------------
+# 7. Location + Time Summary
+# -------------------------
+
+location_time_summary = (
+    df.groupby(["Location", "Class_Time"])
+    .agg(
+        total_students=("Students_in_Class", "sum"),
+        total_capacity=("Class_Capacity", "sum"),
+        avg_parent_rating=("Parent_Rating", "mean"),
+        total_records=("Location", "count")
+    )
+    .reset_index()
+)
+
+location_time_summary["occupancy_rate"] = (
+    location_time_summary["total_students"] / location_time_summary["total_capacity"]
+)
+
+location_time_summary["occupancy_status"] = (
+    location_time_summary["occupancy_rate"].apply(classify_occupancy)
+)
+
+location_time_summary = location_time_summary.sort_values("occupancy_rate", ascending=False)
+
+
+# -------------------------
+# 8. Time Slot Summary
+# -------------------------
+
+time_summary = (
+    df.groupby("Class_Time")
+    .agg(
+        total_students=("Students_in_Class", "sum"),
+        total_capacity=("Class_Capacity", "sum"),
+        total_records=("Class_Time", "count")
+    )
+    .reset_index()
+)
+
+time_summary["occupancy_rate"] = (
+    time_summary["total_students"] / time_summary["total_capacity"]
+)
+
+time_summary = time_summary.sort_values("occupancy_rate", ascending=False)
+
+
+# -------------------------
+# 9. Weekend vs Weekday Summary
+# -------------------------
+
+weekend_summary = (
+    df.groupby("Is_Weekend")
+    .agg(
+        total_students=("Students_in_Class", "sum"),
+        total_capacity=("Class_Capacity", "sum"),
+        total_records=("Is_Weekend", "count")
+    )
+    .reset_index()
+)
+
+weekend_summary["occupancy_rate"] = (
+    weekend_summary["total_students"] / weekend_summary["total_capacity"]
+)
+
+
+# -------------------------
+# 10. Key Event Tables
+# -------------------------
+
+event_columns = [
+    "Date",
+    "Day_of_Week",
+    "Location",
+    "Class_Time",
+    "Students_in_Class",
+    "Class_Capacity",
+    "Occupancy_Rate"
+]
+
+overflow_events = (
+    df[df["Occupancy_Status"] == "Overflow"][event_columns]
+    .sort_values("Occupancy_Rate", ascending=False)
+)
+
+near_full_events = (
+    df[df["Occupancy_Status"] == "Near Full"][event_columns]
+    .sort_values("Occupancy_Rate", ascending=False)
+)
+
+underutilized_events = (
+    df[df["Occupancy_Status"] == "Underutilized"][event_columns]
+    .sort_values("Occupancy_Rate", ascending=True)
+)
+
+
+# -------------------------
+# 11. Generate Operational AI Summary
+# -------------------------
+
+operations_prompt = f"""
+You are a careful business operations analyst for a swim school.
+
+Analyze the KPI summary and operational tables below.
+
+Business definitions:
+- occupancy_rate = total_students / total_capacity
+- occupancy_rate > 1.00 means Overflow: students exceeded planned capacity
+- occupancy_rate between 0.90 and 1.00 means Near Full: strong demand and limited remaining capacity
+- occupancy_rate between 0.70 and 0.90 means Healthy utilization
+- occupancy_rate below 0.70 means Underutilized: potential resource inefficiency
+
+Important rules:
+- Do NOT infer demand from record count alone.
+- Use occupancy_rate as the main demand indicator.
+- Always mention overflow events if they exist.
+- Identify both high-demand and underutilized patterns.
+- Compare location, time slot, and weekend vs weekday patterns.
+- Support each insight with specific numbers.
+- Do not invent causes that are not supported by the data.
+- Use cautious language such as "may indicate" or "suggests" when explaining possible reasons.
+- Avoid generic consulting language.
+
+Please provide:
+1. Executive summary in 3 bullet points
+2. Three key business insights
+3. Two operational risks
+4. Three recommended actions for managers
+5. One sentence explaining how these findings could support scheduling decisions
+
+KPI Summary:
+{summary}
+
+Location Summary:
+{location_summary.round(4).to_string(index=False)}
+
+Location-Time Summary:
+{location_time_summary.round(4).to_string(index=False)}
+
+Time Slot Summary:
+{time_summary.round(4).to_string(index=False)}
+
+Weekend vs Weekday Summary:
+{weekend_summary.round(4).to_string(index=False)}
+
+Overflow Events:
+{overflow_events.round(4).to_string(index=False)}
+
+Near-Full Events:
+{near_full_events.head(10).round(4).to_string(index=False)}
+
+Underutilized Events:
+{underutilized_events.head(10).round(4).to_string(index=False)}
+"""
+
+operations_response = model.generate_content(operations_prompt)
+operations_summary = operations_response.text
+
+print("===== IMPROVED OPERATIONAL AI SUMMARY =====")
+print(operations_summary)
+
+
+# -------------------------
+# 12. Parent Review Sentiment Analysis
+# -------------------------
+
+unique_reviews = df["Parent_Review_Text"].dropna().unique().tolist()
+
+sentiment_prompt = f"""
+You are a careful business operations analyst for a swim school.
+
+Analyze the parent review comments below.
+
+Important rules:
+- Separate what parents directly mentioned from possible business interpretations.
+- Do NOT overstate complaints unless they appear repeatedly.
+- Use cautious language such as "parents mentioned", "some parents expressed", or "reviews suggest".
+- Avoid making strong claims about safety, revenue loss, or customer churn unless directly supported.
+- Connect review themes to operational data only when clearly supported.
+- Avoid generic recommendations.
+- Focus on themes that managers can act on.
+
+Please provide:
+
+1. Overall parent sentiment
+2. Top positive themes
+3. Top negative themes
+4. Why families may join or stay
+5. Why families may leave
+6. Five practical recommendations for school managers
+7. One paragraph connecting parent feedback with operational utilization patterns
+
+Parent Reviews:
+{unique_reviews}
+"""
+
+sentiment_response = model.generate_content(sentiment_prompt)
+sentiment_summary = sentiment_response.text
+
+print("\n===== AI SENTIMENT ANALYSIS =====")
+print(sentiment_summary)
+
+
+# -------------------------
+# 13. Helper Function: Write AI Text to Excel Sheet
+# -------------------------
+
+def write_ai_text_to_sheet(ws, title, ai_text):
+    ws["A1"] = title
+    ws["A1"].font = Font(bold=True, size=16)
+
+    lines = ai_text.split("\n")
+    row_num = 3
+
+    for line in lines:
+        line = line.strip()
+
+        # Leave one empty row between sections
+        if line == "":
+            row_num += 1
+            continue
+
+        # Clean Markdown symbols
+        clean_line = line.replace("###", "").replace("##", "").replace("#", "").strip()
+        clean_line = clean_line.replace("**", "").strip()
+
+        cell = ws.cell(row=row_num, column=1, value=clean_line)
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+        # Bold section headings
+        if line.startswith("#") or clean_line.endswith(":"):
+            cell.font = Font(bold=True, size=13)
+
+        # Bold numbered points
+        elif clean_line.startswith(("1.", "2.", "3.", "4.", "5.", "6.", "7.")):
+            cell.font = Font(bold=True)
+
+        ws.row_dimensions[row_num].height = 45
+        row_num += 1
+
+    ws.column_dimensions["A"].width = 120
+
+
+# -------------------------
+# 14. Helper Function: Write DataFrame to Excel Sheet
+# -------------------------
+
+def write_df_to_sheet(workbook, sheet_name, dataframe):
+    ws = workbook.create_sheet(sheet_name)
+
+    # Write headers
+    for col_idx, col_name in enumerate(dataframe.columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+    # Write data rows
+    for row_idx, row in enumerate(dataframe.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+
+            if isinstance(value, pd.Timestamp):
+                cell.value = value.to_pydatetime()
+                cell.number_format = "yyyy-mm-dd"
+
+            if "Rate" in str(dataframe.columns[col_idx - 1]) or "rate" in str(dataframe.columns[col_idx - 1]):
+                cell.number_format = "0.00%"
+
+    # Auto-adjust column widths
+    for column_cells in ws.columns:
+        max_length = 0
+        column_letter = column_cells[0].column_letter
+
+        for cell in column_cells:
+            if cell.value is not None:
+                max_length = max(max_length, len(str(cell.value)))
+
+        ws.column_dimensions[column_letter].width = min(max_length + 2, 30)
+
+
+# -------------------------
+# 15. Write Results Back to Excel
+# -------------------------
+
+wb = load_workbook(file_path)
+
+# Remove old sheets if they already exist
+sheets_to_remove = [
+    "AI_Operations_Summary",
+    "AI_Sentiment_Analysis",
+    "Location_Summary",
+    "Location_Time_Summary",
+    "Time_Summary",
+    "Weekend_Summary",
+    "Overflow_Events",
+    "Near_Full_Events",
+    "Underutilized_Events"
+]
+
+for sheet_name in sheets_to_remove:
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+
+
+# -------------------------
+# 16. Create AI Summary Sheets
+# -------------------------
+
+ws1 = wb.create_sheet("AI_Operations_Summary")
+write_ai_text_to_sheet(
+    ws1,
+    "AI-Generated Operational Analysis",
+    operations_summary
+)
+
+ws2 = wb.create_sheet("AI_Sentiment_Analysis")
+write_ai_text_to_sheet(
+    ws2,
+    "AI Parent Sentiment Analysis",
+    sentiment_summary
+)
+
+
+# -------------------------
+# 17. Create Data Summary Sheets
+# -------------------------
+
+write_df_to_sheet(wb, "Location_Summary", location_summary)
+write_df_to_sheet(wb, "Location_Time_Summary", location_time_summary)
+write_df_to_sheet(wb, "Time_Summary", time_summary)
+write_df_to_sheet(wb, "Weekend_Summary", weekend_summary)
+write_df_to_sheet(wb, "Overflow_Events", overflow_events)
+write_df_to_sheet(wb, "Near_Full_Events", near_full_events)
+write_df_to_sheet(wb, "Underutilized_Events", underutilized_events)
+
+
+# -------------------------
+# 18. Save New Report
+# -------------------------
+
+output_file = "goldfish_ai_business_report.xlsx"
+
+if os.path.exists(output_file):
+    os.remove(output_file)
+
+wb.save(output_file)
+
+print("\n====================================")
+print("AI Business Report Saved Successfully")
+print("Output File:", output_file)
+print("====================================")
